@@ -1,0 +1,132 @@
+from flask import Flask, render_template, request, jsonify, make_response
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from pathlib import Path
+import re
+import os
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB upload limit
+BASE_DIR = Path(__file__).resolve().parent
+REFERENCE_DIR = BASE_DIR / "reference_documents"
+ALLOWED_EXTENSIONS = {".txt"}
+
+def normalize(text):
+    """Normalize whitespace/case while preserving meaningful words and punctuation."""
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+def split_sentences(text):
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+    return [p.strip() for p in parts if len(p.strip()) >= 20]
+
+def load_references():
+    refs = []
+    REFERENCE_DIR.mkdir(exist_ok=True)
+    for path in sorted(REFERENCE_DIR.glob("*.txt")):
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore").strip()
+            if content:
+                refs.append({"name": path.name, "text": content})
+        except OSError:
+            continue
+    return refs
+
+def analyze_document(text):
+    references = load_references()
+    sentences = split_sentences(text)
+    findings = []
+    if references and sentences:
+        corpus = [s for s in sentences] + [r["text"] for r in references]
+        try:
+            vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english")
+            matrix = vectorizer.fit_transform(corpus)
+            sentence_vectors = matrix[:len(sentences)]
+            ref_vectors = matrix[len(sentences):]
+            similarities = cosine_similarity(sentence_vectors, ref_vectors)
+            for i, sentence in enumerate(sentences):
+                best_idx = int(similarities[i].argmax())
+                score = float(similarities[i, best_idx])
+                ref = references[best_idx]
+                exact = normalize(sentence) in normalize(ref["text"])
+                if exact or score >= 0.24:
+                    findings.append({
+                        "passage": sentence,
+                        "source": ref["name"],
+                        "similarity": round(score * 100, 1),
+                        "match_type": "Exact text match" if exact else "Text similarity",
+                        "evidence": "The submitted passage appears verbatim in this local reference." if exact else "Word/phrase overlap was found against this local reference. Review the context manually."
+                    })
+        except ValueError:
+            findings = []
+
+    # A transparent heuristic score: share of analyzed sentences flagged, not a universal plagiarism score.
+    flagged = len(findings)
+    score = round((flagged / max(len(sentences), 1)) * 100, 1)
+    citation_markers = len(re.findall(r"\([A-Z][A-Za-z-]+(?:\s+et al\.)?,?\s*(?:19|20)\d{2}\)|\[\d+\]", text))
+    return {
+        "document_sentences": len(sentences),
+        "reference_count": len(references),
+        "findings": findings,
+        "flagged_sentence_percent": score,
+        "citation_markers_detected": citation_markers,
+        "notice": "This prototype compares text only with the local reference_documents collection. Similarity is not proof of plagiarism."
+    }
+
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+@app.post("/api/analyze")
+def analyze():
+    text = request.form.get("text", "").strip()
+    uploaded = request.files.get("file")
+    if uploaded and uploaded.filename:
+        if Path(uploaded.filename).suffix.lower() not in ALLOWED_EXTENSIONS:
+            return jsonify({"error": "For this MVP, upload a .txt file. PDF/DOCX support is not enabled yet."}), 400
+        file_text = uploaded.read(2 * 1024 * 1024 + 1)
+        if len(file_text) > 2 * 1024 * 1024:
+            return jsonify({"error": "File exceeds the 2 MB limit."}), 413
+        text = file_text.decode("utf-8", errors="ignore").strip()
+    if len(text) < 20:
+        return jsonify({"error": "Enter or upload at least 20 characters of research text."}), 400
+    result = analyze_document(text)
+    result["agent_review"] = build_review(result)
+    return jsonify(result)
+
+def build_review(result):
+    notes = []
+    if result["reference_count"] == 0:
+        notes.append("No local reference documents were found. Add .txt sources to reference_documents/ before scanning.")
+    if result["findings"]:
+        notes.append(f"{len(result['findings'])} passage(s) need human review against the listed local sources.")
+    else:
+        notes.append("No passages crossed this prototype's matching threshold. This does not establish that the paper is original.")
+    if result["citation_markers_detected"] == 0:
+        notes.append("No common author-year or numeric citation markers were detected by the simple citation heuristic. Check citations manually.")
+    else:
+        notes.append(f"Detected {result['citation_markers_detected']} citation-like marker(s); this does not verify that citations are correct.")
+    return notes
+
+@app.post("/api/report")
+def report():
+    data = request.get_json(silent=True) or {}
+    title = str(data.get("title", "PaperProof AI Analysis Report"))[:160]
+    findings = data.get("findings", [])
+    lines = [title, "=" * len(title), "", "Prototype report: matches are review signals, not a plagiarism verdict.", ""]
+    for idx, item in enumerate(findings, 1):
+        lines += [
+            f"{idx}. {item.get('match_type', 'Similarity finding')}",
+            f"Source: {item.get('source', 'Unknown')}",
+            f"Similarity: {item.get('similarity', 'N/A')}%",
+            f"Submitted passage: {item.get('passage', '')}",
+            f"Evidence note: {item.get('evidence', '')}",
+            ""
+        ]
+    lines.append("Scope: local reference documents only. No internet-wide search is performed.")
+    response = make_response("\n".join(lines))
+    response.headers["Content-Type"] = "text/plain; charset=utf-8"
+    response.headers["Content-Disposition"] = 'attachment; filename="paperproof-report.txt"'
+    return response
+
+if __name__ == "__main__":
+    app.run(debug=True)
